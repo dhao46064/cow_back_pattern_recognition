@@ -4,7 +4,8 @@
 
 项目覆盖牛背分割、OBB 旋转裁剪与对齐、身份特征学习、开放集异常筛查、困难负样本构建、颜色域偏移分析以及统计验证。当前代码以研究复现和论文实验为主要用途。
 
-![项目模型框架](paper_materials/cow_model_paper.svg)
+<img width="1264" height="632" alt="image" src="https://github.com/user-attachments/assets/38c8acf2-d0cb-496d-b5d0-15785a07fc61" />
+
 
 ## 研究问题
 
@@ -30,7 +31,39 @@
 - 红色域增强能够减小同牛正常样本的类内波动，但没有进一步提高困难开放集的 Precision、Recall 或 F1，因此最终模型不采用该增强。
 - 对逐牛结果的分析显示，Hard gap 改善与 Normal Recall 改善呈显著正相关（`r=0.593`，`p<0.001`，`n=192`）。
 
-完整的项目过程、数据统计、实验结果与讨论见 [背纹总结](docs/%E8%83%8C%E7%BA%B9%E6%80%BB%E7%BB%939.17.docx)。
+## Feature-space Geometry and Cleaning Performance
+
+除了比较 Precision、Recall 和 F1，本项目还分析了模型在特征空间中的几何关系，以解释性能变化的来源。所有图像特征均经过 L2 归一化，并使用余弦距离衡量样本之间的差异。
+
+对于每头牛，定义以下指标：
+
+| 指标 | 定义 | 期望变化 |
+|---|---|---|
+| Same normal | 同一头牛正常图像之间的平均距离 | 越小越好 |
+| Hard N-A | 正常图像与困难异常图像之间的平均距离 | 越大越好 |
+| Hard gap | `Hard N-A - Same normal` | 越大越好 |
+
+其中，Same normal 反映同一身份正常样本的类内紧致程度；Hard N-A 反映模型区分纹理相似异牛样本的能力；Hard gap 同时考虑类内波动与困难异常分离距离，因此能够更完整地描述正常样本与异常样本之间的有效判别空间。
+
+实验结果显示，Center Loss 主要降低 Same normal，使同一头牛的正常样本在特征空间中更加紧凑。然而，更紧凑的类内分布并不必然带来更好的困难异常识别性能。如果 Hard N-A 同时下降，模型仍可能难以区分外观相似的其他牛只。
+
+相比之下，SupCon Loss 的主要作用不是单纯压缩类内距离，而是扩大困难异常样本与正常特征簇之间的距离。在 ResNet50 和 DOLG 两种骨干网络下，SupCon 均提高了 Hard gap，说明其能够形成更清晰的正常—异常判别边界。
+
+在逐牛分析中，DOLG + ArcFace + SupCon 相对于 DOLG + ArcFace 的 Hard gap 改善与 Normal Recall 改善呈显著正相关：
+
+```text
+Pearson r = 0.593
+95% CI = 0.493–0.675
+p < 0.001
+n = 192 cows
+R² = 0.352
+```
+
+这意味着，当 SupCon 扩大某头牛的有效特征分离裕量时，该牛的真实正常图像通常也能得到更好的保留。特征空间中的几何改善因此能够反映到实际数据清洗性能中。
+
+需要注意的是，该分析证明的是统计相关关系，而不是严格的因果关系。不过，它说明了只关注类内紧致性是不够的：对于面向相似异牛样本的开放集清洗任务，正常样本与困难异常样本之间的有效分离裕量更加重要。
+<img width="415" height="341" alt="image" src="https://github.com/user-attachments/assets/d6f43b62-99cd-4441-bf6a-e693b925a8d3" />
+
 
 ## 仓库结构
 
