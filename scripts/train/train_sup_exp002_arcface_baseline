@@ -1,0 +1,1078 @@
+# -*- coding: utf-8 -*-
+r"""
+ArcFace训练入口，集成：
+1. 在线红色增强；
+2. 完整argument与环境日志；
+3. 日志和checkpoint分离；
+4. GAP/GeM、L5约束；
+5. seen_train/seen_val训练验证。
+
+固定目录：
+
+日志：
+    D:\code_project\cow_recognition\logs\train_logs
+
+checkpoint：
+    D:\code_project\cow_recognition\outputs
+"""
+
+import argparse
+import os
+import random
+import sys
+
+from pathlib import Path
+CURRENT_FILE = Path(__file__).resolve()
+
+# parents[0] = scripts\train
+# parents[1] = scripts
+# parents[2] = cow_recognition
+PROJECT_ROOT = CURRENT_FILE.parents[2]
+
+SRC_ROOT = PROJECT_ROOT / "src"
+
+if not SRC_ROOT.exists():
+    raise FileNotFoundError(
+        f"没有找到src目录：{SRC_ROOT}\n"
+        f"当前训练脚本：{CURRENT_FILE}\n"
+        f"计算得到的项目根目录：{PROJECT_ROOT}"
+    )
+
+# 必须使用insert(0)，保证优先加载当前项目中的src
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(
+        0,
+        str(PROJECT_ROOT),
+    )
+
+print("=" * 80)
+print(f"训练脚本：{CURRENT_FILE}")
+print(f"项目根目录：{PROJECT_ROOT}")
+print(f"src目录：{SRC_ROOT}")
+print("=" * 80)
+
+
+import numpy as np
+import torch
+import torch.optim as optim
+
+from torch.utils.data import DataLoader
+
+
+# 当前脚本假设位于项目根目录。
+PROJECT_ROOT = Path(
+    __file__
+).resolve().parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(
+        0,
+        str(PROJECT_ROOT),
+    )
+
+
+from src.augmentations.red_color_shift import (
+    CowBackRedColorShift,
+)
+from src.datasets.split import get_samples
+from src.datasets.dataset_OBB_normal import (
+    CowTrainDatasetNormal,
+    CowValDatasetFromSplit,
+)
+from src.engine.arcface_trainer import ArcFaceTrainer
+from src.models.arcface_model import ArcFaceCowModel
+from src.utils.common import set_seed
+from src.utils.train_logger import (
+    close_training_logger,
+    create_training_run,
+    save_training_config,
+)
+from src.utils.transforms import build_transforms
+
+
+# =========================================================
+# 固定路径：严格按当前项目要求
+# =========================================================
+
+LOG_ROOT = Path(
+    r"D:\code_project\cow_recognition"
+    r"\logs\train_logs"
+)
+
+OUTPUT_ROOT = Path(
+    r"D:\code_project\cow_recognition"
+    r"\outputs"
+)
+
+DEFAULT_DATA_ROOT = Path(
+    r"D:\datasets\cow_recognition8.3"
+    r"\train_dataset"
+)
+
+DEFAULT_MASK_ROOT = Path(
+    r"D:\datasets\cow_recognition8.3"
+    r"\train_dataset_masks"
+)
+
+
+def seed_worker(worker_id):
+    """
+    保证DataLoader worker中的numpy与random可复现。
+    """
+    worker_seed = (
+        torch.initial_seed()
+        % 2**32
+    )
+
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def validate_arguments(args):
+    if not 0.0 <= args.red_aug_prob <= 1.0:
+        raise ValueError(
+            "red_aug_prob必须位于[0, 1]。"
+        )
+
+    if len(args.red_strengths) != len(
+        args.red_strength_probs
+    ):
+        raise ValueError(
+            "red_strengths与red_strength_probs"
+            "长度必须一致。"
+        )
+
+    if args.epochs <= 0:
+        raise ValueError(
+            "epochs必须大于0。"
+        )
+
+    if args.batch_size <= 0:
+        raise ValueError(
+            "batch_size必须大于0。"
+        )
+
+    if args.val_batch_size <= 0:
+        raise ValueError(
+            "val_batch_size必须大于0。"
+        )
+
+
+def load_checkpoint(
+    model,
+    optimizer,
+    checkpoint_path: str,
+    device,
+    logger,
+    resume_only_model: bool = False,
+):
+    """
+    加载模型或完整训练状态。
+    """
+    if not checkpoint_path:
+        return (
+            model,
+            optimizer,
+            1,
+            None,
+        )
+
+    checkpoint_file = Path(
+        checkpoint_path
+    )
+
+    if not checkpoint_file.exists():
+        raise FileNotFoundError(
+            f"Checkpoint不存在：{checkpoint_file}"
+        )
+
+    logger.info(
+        f"Loading checkpoint: "
+        f"{checkpoint_file}"
+    )
+
+    checkpoint = torch.load(
+        checkpoint_file,
+        map_location=device,
+    )
+
+    if (
+        isinstance(checkpoint, dict)
+        and "model" in checkpoint
+    ):
+        model.load_state_dict(
+            checkpoint["model"],
+            strict=True,
+        )
+
+    elif (
+        isinstance(checkpoint, dict)
+        and "model_state_dict" in checkpoint
+    ):
+        model.load_state_dict(
+            checkpoint["model_state_dict"],
+            strict=True,
+        )
+
+    else:
+        model.load_state_dict(
+            checkpoint,
+            strict=True,
+        )
+
+    optimizer_restored = False
+
+    if (
+        not resume_only_model
+        and isinstance(checkpoint, dict)
+        and "optimizer" in checkpoint
+    ):
+        optimizer.load_state_dict(
+            checkpoint["optimizer"]
+        )
+
+        optimizer_restored = True
+
+    if isinstance(checkpoint, dict):
+        start_epoch = int(
+            checkpoint.get(
+                "epoch",
+                0,
+            )
+        ) + 1
+    else:
+        start_epoch = 1
+
+    logger.info(
+        "Checkpoint loaded | "
+        f"start_epoch={start_epoch} | "
+        f"optimizer_restored="
+        f"{optimizer_restored}"
+    )
+
+    return (
+        model,
+        optimizer,
+        start_epoch,
+        checkpoint,
+    )
+
+
+def build_argument_parser():
+    parser = argparse.ArgumentParser(
+        description=(
+            "ArcFace cow-back recognition "
+            "training with online red augmentation"
+        )
+    )
+
+    # =====================================================
+    # 实验
+    # =====================================================
+    parser.add_argument(
+        "--exp_name",
+        type=str,
+        default="arcface_redaug_p00",
+    )
+
+    # =====================================================
+    # 数据
+    # =====================================================
+    parser.add_argument(
+        "--obb_root",
+        type=str,
+        default=str(DEFAULT_DATA_ROOT),
+    )
+
+    parser.add_argument(
+        "--red_mask_root",
+        type=str,
+        default=str(DEFAULT_MASK_ROOT),
+    )
+
+    parser.add_argument(
+        "--train_augment",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "是否启用build_transforms(train=True)"
+            "中的普通训练增强。"
+        ),
+    )
+
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=64,
+    )
+
+    parser.add_argument(
+        "--val_batch_size",
+        type=int,
+        default=32,
+    )
+
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+    )
+
+    # =====================================================
+    # 在线红色增强
+    # =====================================================
+    parser.add_argument(
+        "--red_aug_prob",
+        type=float,
+        default=0.2,
+    )
+
+    parser.add_argument(
+        "--red_strengths",
+        type=float,
+        nargs="+",
+        default=[
+            0.4,
+            0.6,
+            0.8,
+            1.0,
+        ],
+    )
+
+    parser.add_argument(
+        "--red_strength_probs",
+        type=float,
+        nargs="+",
+        default=[
+            0.35,
+            0.35,
+            0.20,
+            0.10,
+        ],
+    )
+
+    parser.add_argument(
+        "--red_r_target",
+        type=float,
+        default=0.78,
+    )
+
+    parser.add_argument(
+        "--red_g_target",
+        type=float,
+        default=0.55,
+    )
+
+    parser.add_argument(
+        "--red_b_target",
+        type=float,
+        default=0.50,
+    )
+
+    parser.add_argument(
+        "--missing_mask_policy",
+        type=str,
+        choices=[
+            "error",
+            "original",
+        ],
+        default="error",
+    )
+
+    parser.add_argument(
+        "--validate_red_masks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+
+    # =====================================================
+    # 训练
+    # =====================================================
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=50,
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+    )
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+    )
+
+    parser.add_argument(
+        "--save_every_epoch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+
+    # =====================================================
+    # 恢复训练
+    # =====================================================
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="",
+    )
+
+    parser.add_argument(
+        "--resume_only_model",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+
+    # =====================================================
+    # 模型
+    # =====================================================
+    parser.add_argument(
+        "--embedding_dim",
+        type=int,
+        default=128,
+    )
+
+    parser.add_argument(
+        "--hidden_dims",
+        type=int,
+        nargs="+",
+        default=[
+            1024,
+            128,
+        ],
+    )
+
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.3,
+    )
+
+    parser.add_argument(
+        "--pretrained",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+
+    parser.add_argument(
+        "--freeze_backbone",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+
+    # =====================================================
+    # GAP / GeM
+    # =====================================================
+    parser.add_argument(
+        "--use_gem",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+
+    parser.add_argument(
+        "--gem_p",
+        type=float,
+        default=3.0,
+    )
+
+    parser.add_argument(
+        "--gem_learn_p",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+
+    # =====================================================
+    # ArcFace
+    # =====================================================
+    parser.add_argument(
+        "--arc_s",
+        type=float,
+        default=30.0,
+    )
+
+    parser.add_argument(
+        "--arc_m",
+        type=float,
+        default=0.25,
+    )
+
+    # =====================================================
+    # 优化器
+    # =====================================================
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=3e-4,
+    )
+
+    parser.add_argument(
+        "--wd",
+        type=float,
+        default=1e-4,
+    )
+
+    # =====================================================
+    # L5角度约束
+    # =====================================================
+    parser.add_argument(
+        "--return_theta",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+
+    parser.add_argument(
+        "--lambda_intra",
+        type=float,
+        default=0.02,
+    )
+
+    # =====================================================
+    # 验证与best判断
+    # =====================================================
+    parser.add_argument(
+        "--acc_eps",
+        type=float,
+        default=1e-4,
+    )
+
+    parser.add_argument(
+        "--same_eps",
+        type=float,
+        default=1e-4,
+    )
+
+    parser.add_argument(
+        "--max_pairs_per_class",
+        type=int,
+        default=2000,
+    )
+
+    return parser
+
+
+def main():
+    parser = build_argument_parser()
+    args = parser.parse_args()
+
+    validate_arguments(args)
+
+    # 日志和checkpoint严格使用固定根目录。
+    (
+        logger,
+        log_run_dir,
+        output_run_dir,
+        run_name,
+    ) = create_training_run(
+        log_root=str(LOG_ROOT),
+        output_root=str(OUTPUT_ROOT),
+        exp_name=args.exp_name,
+    )
+
+    try:
+        set_seed(args.seed)
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+
+        requested_device = str(
+            args.device
+        )
+
+        if (
+            requested_device.startswith("cuda")
+            and not torch.cuda.is_available()
+        ):
+            logger.warning(
+                "CUDA不可用，自动切换到CPU。"
+            )
+
+            device = torch.device(
+                "cpu"
+            )
+        else:
+            device = torch.device(
+                requested_device
+            )
+
+        data_root = Path(
+            args.obb_root
+        )
+
+        mask_root = Path(
+            args.red_mask_root
+        )
+
+        if not data_root.exists():
+            raise FileNotFoundError(
+                f"训练数据集不存在：{data_root}"
+            )
+
+        if (
+            args.red_aug_prob > 0
+            and not mask_root.exists()
+        ):
+            raise FileNotFoundError(
+                f"红色增强mask目录不存在：{mask_root}"
+            )
+
+        train_samples = get_samples(
+            args.obb_root,
+            "seen_train",
+        )
+
+        val_samples = get_samples(
+            args.obb_root,
+            "seen_val",
+        )
+
+        if len(train_samples) == 0:
+            raise RuntimeError(
+                "seen_train为空。"
+            )
+
+        if len(val_samples) == 0:
+            raise RuntimeError(
+                "seen_val为空。"
+            )
+
+        train_transform = build_transforms(
+            train=args.train_augment
+        )
+
+        val_transform = build_transforms(
+            train=False
+        )
+
+        train_cow_ids = sorted(
+            set(
+                str(sample["cow_id"])
+                for sample in train_samples
+            )
+        )
+
+        id2label = {
+            cow_id: index
+            for index, cow_id in enumerate(
+                train_cow_ids
+            )
+        }
+
+        num_train_classes = len(
+            id2label
+        )
+
+        red_augment = CowBackRedColorShift(
+            image_root=args.obb_root,
+            mask_root=args.red_mask_root,
+            probability=args.red_aug_prob,
+            strengths=args.red_strengths,
+            strength_probs=(
+                args.red_strength_probs
+            ),
+            r_target=args.red_r_target,
+            g_target=args.red_g_target,
+            b_target=args.red_b_target,
+            missing_mask_policy=(
+                args.missing_mask_policy
+            ),
+        )
+
+        if (
+            args.red_aug_prob > 0
+            and args.validate_red_masks
+        ):
+            logger.info(
+                "开始检查seen_train对应mask。"
+            )
+
+            missing_masks = (
+                red_augment.find_missing_masks(
+                    sample["path"]
+                    for sample in train_samples
+                )
+            )
+
+            if missing_masks:
+                preview = "\n".join(
+                    (
+                        f"image={record['image_path']} | "
+                        f"mask={record['mask_path']}"
+                    )
+                    for record in missing_masks[:20]
+                )
+
+                raise FileNotFoundError(
+                    f"共有{len(missing_masks)}张训练图片"
+                    "缺少对应mask。\n"
+                    f"前20条：\n{preview}"
+                )
+
+            logger.info(
+                "seen_train对应mask检查通过。"
+            )
+
+        train_dataset = CowTrainDatasetNormal(
+            samples=train_samples,
+            transform=train_transform,
+            id2label=id2label,
+            red_augment=red_augment,
+        )
+
+        val_dataset = CowValDatasetFromSplit(
+            samples=val_samples,
+            id2label=id2label,
+            transform=val_transform,
+        )
+
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(
+            args.seed
+        )
+
+        pin_memory = (
+            device.type == "cuda"
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+            worker_init_fn=seed_worker,
+            generator=loader_generator,
+            persistent_workers=(
+                args.num_workers > 0
+            ),
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.val_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+            worker_init_fn=seed_worker,
+            persistent_workers=(
+                args.num_workers > 0
+            ),
+        )
+
+        if (
+            args.red_aug_prob > 0
+            and args.num_workers > 0
+        ):
+            logger.warning(
+                "num_workers>0时红色增强本身正常工作，"
+                "但Trainer从主进程读取的每轮增强计数"
+                "不会包含各worker内部完整统计。"
+            )
+
+        model = ArcFaceCowModel(
+            num_classes=num_train_classes,
+            embedding_dim=args.embedding_dim,
+            s=args.arc_s,
+            m=args.arc_m,
+            pretrained=args.pretrained,
+            freeze_backbone=(
+                args.freeze_backbone
+            ),
+            hidden_dims=tuple(
+                args.hidden_dims
+            ),
+            dropout=args.dropout,
+            use_gem=args.use_gem,
+            gem_p=args.gem_p,
+            gem_learn_p=(
+                args.gem_learn_p
+            ),
+        )
+
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.wd,
+        )
+
+        start_epoch = 1
+        resume_checkpoint = None
+
+        if args.resume:
+            (
+                model,
+                optimizer,
+                start_epoch,
+                resume_checkpoint,
+            ) = load_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                checkpoint_path=args.resume,
+                device=device,
+                logger=logger,
+                resume_only_model=(
+                    args.resume_only_model
+                ),
+            )
+
+        total_parameters = sum(
+            parameter.numel()
+            for parameter in model.parameters()
+        )
+
+        trainable_parameters = sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        )
+
+        save_training_config(
+            logger=logger,
+            log_run_dir=log_run_dir,
+            args=args,
+            model_config={
+                "model_class": (
+                    model.__class__.__name__
+                ),
+                "num_classes": (
+                    num_train_classes
+                ),
+                "embedding_dim": (
+                    args.embedding_dim
+                ),
+                "hidden_dims": (
+                    args.hidden_dims
+                ),
+                "dropout": args.dropout,
+                "pretrained": args.pretrained,
+                "freeze_backbone": (
+                    args.freeze_backbone
+                ),
+                "pooling": (
+                    "GeM"
+                    if args.use_gem
+                    else "GAP"
+                ),
+                "use_gem": args.use_gem,
+                "gem_p_initial": (
+                    args.gem_p
+                ),
+                "gem_learn_p": (
+                    args.gem_learn_p
+                ),
+                "arc_s": args.arc_s,
+                "arc_m": args.arc_m,
+                "total_parameters": (
+                    total_parameters
+                ),
+                "trainable_parameters": (
+                    trainable_parameters
+                ),
+            },
+            data_config={
+                "dataset_root": str(
+                    data_root
+                ),
+                "split_json": str(
+                    data_root / "split.json"
+                ),
+                "train_samples": len(
+                    train_samples
+                ),
+                "val_samples": len(
+                    val_samples
+                ),
+                "train_cow_count": len(
+                    train_cow_ids
+                ),
+                "train_dataset_class": (
+                    train_dataset
+                    .__class__
+                    .__name__
+                ),
+                "val_dataset_class": (
+                    val_dataset
+                    .__class__
+                    .__name__
+                ),
+                "train_transform": repr(
+                    train_transform
+                ),
+                "val_transform": repr(
+                    val_transform
+                ),
+                "batch_size": (
+                    args.batch_size
+                ),
+                "val_batch_size": (
+                    args.val_batch_size
+                ),
+                "num_workers": (
+                    args.num_workers
+                ),
+                "pin_memory": (
+                    pin_memory
+                ),
+            },
+            augmentation_config={
+                "ordinary_train_augment": (
+                    args.train_augment
+                ),
+                "red_augmentation_enabled": (
+                    args.red_aug_prob > 0
+                ),
+                **red_augment.get_config(),
+                "validate_red_masks": (
+                    args.validate_red_masks
+                ),
+            },
+            optimizer_config={
+                "optimizer_class": (
+                    optimizer
+                    .__class__
+                    .__name__
+                ),
+                "learning_rate": (
+                    args.lr
+                ),
+                "weight_decay": (
+                    args.wd
+                ),
+            },
+            trainer_config={
+                "trainer_class": (
+                    ArcFaceTrainer.__name__
+                ),
+                "epochs": args.epochs,
+                "start_epoch": (
+                    start_epoch
+                ),
+                "seed": args.seed,
+                "device": str(device),
+                "return_theta": (
+                    args.return_theta
+                ),
+                "lambda_intra": (
+                    args.lambda_intra
+                ),
+                "acc_eps": (
+                    args.acc_eps
+                ),
+                "same_eps": (
+                    args.same_eps
+                ),
+                "max_pairs_per_class": (
+                    args.max_pairs_per_class
+                ),
+                "save_every_epoch": (
+                    args.save_every_epoch
+                ),
+            },
+            resume_config={
+                "resume_enabled": bool(
+                    args.resume
+                ),
+                "resume_path": args.resume,
+                "resume_only_model": (
+                    args.resume_only_model
+                ),
+                "resume_checkpoint_loaded": (
+                    resume_checkpoint
+                    is not None
+                ),
+            },
+            extra_config={
+                "run_name": run_name,
+                "log_root": str(
+                    LOG_ROOT
+                ),
+                "log_run_dir": str(
+                    log_run_dir
+                ),
+                "output_root": str(
+                    OUTPUT_ROOT
+                ),
+                "output_run_dir": str(
+                    output_run_dir
+                ),
+            },
+        )
+
+        trainer = ArcFaceTrainer(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            optimizer=optimizer,
+            device=device,
+            logger=logger,
+            log_run_dir=log_run_dir,
+            output_run_dir=(
+                output_run_dir
+            ),
+            run_name=run_name,
+            seed=args.seed,
+            return_theta=(
+                args.return_theta
+            ),
+            lambda_intra=(
+                args.lambda_intra
+            ),
+            acc_eps=args.acc_eps,
+            same_eps=args.same_eps,
+            max_pairs_per_class=(
+                args.max_pairs_per_class
+            ),
+            save_every_epoch=(
+                args.save_every_epoch
+            ),
+        )
+
+        if resume_checkpoint is not None:
+            trainer.load_state_from_ckpt(
+                resume_checkpoint
+            )
+
+        logger.info(
+            "开始执行ArcFace训练。"
+        )
+
+        trainer.fit(
+            epochs=args.epochs,
+            start_epoch=start_epoch,
+        )
+
+        logger.info(
+            "训练正常完成。"
+        )
+
+    except KeyboardInterrupt:
+        logger.warning(
+            "训练被用户手动中断。"
+        )
+        raise
+
+    except Exception:
+        logger.exception(
+            "训练过程中发生异常。"
+        )
+        raise
+
+    finally:
+        logger.info(
+            f"本次日志目录：{log_run_dir}"
+        )
+
+        logger.info(
+            f"本次输出目录：{output_run_dir}"
+        )
+
+        close_training_logger(
+            logger
+        )
+
+
+if __name__ == "__main__":
+    main()
